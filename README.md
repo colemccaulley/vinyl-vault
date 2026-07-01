@@ -47,8 +47,26 @@ vinyl-vault/
 4. Configure environment
    ```bash
    cp .env.example .env
-   # Edit .env with your Discogs API token
+   # Edit .env with your Discogs personal access token and username
    ```
+
+## Local Pipeline Quick Start
+
+The ingestion CLI defaults to the safe auth-only smoke test. It will not pull your full collection unless you explicitly pass `--fetch-collection`.
+
+```bash
+# Issue #1: verify Discogs authentication
+python src/ingestion/discogs_client.py --test-auth
+
+# Issue #2: pull the full collection to data/raw/collection_YYYY-MM-DD.json
+PYTHONUNBUFFERED=1 python src/ingestion/discogs_client.py --fetch-collection
+
+# Issue #3: profile the newest raw collection and write docs/data_dictionary.md
+python src/transforms/explore_collection.py
+
+# Issue #4: clean/normalize the newest raw collection to data/processed/collection_clean.csv
+python src/transforms/clean_collection.py
+```
 
 ## Tech Stack
 
