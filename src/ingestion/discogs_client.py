@@ -1,144 +1,206 @@
 """
 Discogs API client for Vinyl Vault.
 
-Handles authentication, collection fetching, and raw data export.
+Supports two safe CLI actions:
+- --test-auth: verify DISCOGS_USER_TOKEN and print non-secret profile metadata.
+- --fetch-collection: pull the full collection with pagination and land raw JSON.
+
+Default action is --test-auth so running the script never accidentally starts a
+full collection pull.
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
-from datetime import datetime
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-import discogs_client
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Project paths
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
+DISCOGS_API_BASE = "https://api.discogs.com"
+USER_AGENT = "VinylVault/1.0 +https://github.com/colemccaulley/vinyl-vault"
+PLACEHOLDER_VALUES = {"", "your_token_here", "your_username_here", "changeme", "todo"}
 
 
-def get_client() -> discogs_client.Client:
-    """Create and return an authenticated Discogs client."""
-    token = os.getenv("DISCOGS_USER_TOKEN")
+class DiscogsConfigError(RuntimeError):
+    """Raised when local Discogs configuration is missing or unsafe."""
+
+
+class DiscogsApiError(RuntimeError):
+    """Raised when Discogs returns an unsuccessful API response."""
+
+
+def load_env_file(path: Path | None = None) -> None:
+    """Load simple KEY=VALUE pairs from .env without requiring python-dotenv."""
+    env_path = path or PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+def _clean_env_value(name: str) -> str | None:
+    value = os.getenv(name, "").strip()
+    if value.lower() in PLACEHOLDER_VALUES:
+        return None
+    return value
+
+
+def get_token() -> str:
+    """Return the Discogs personal access token or raise a clear config error."""
+    load_env_file()
+    token = _clean_env_value("DISCOGS_USER_TOKEN")
     if not token:
-        raise ValueError(
-            "DISCOGS_USER_TOKEN not found in environment. "
-            "Copy .env.example to .env and add your token."
+        raise DiscogsConfigError(
+            "DISCOGS_USER_TOKEN is missing or still set to the placeholder value. "
+            "Copy .env.example to .env and add a Discogs personal access token."
         )
+    return token
 
-    return discogs_client.Client(
-        "VinylVault/1.0",
-        user_token=token,
+
+def get_configured_username() -> str | None:
+    """Return optional configured Discogs username, ignoring placeholder values."""
+    load_env_file()
+    return _clean_env_value("DISCOGS_USERNAME")
+
+
+def discogs_get(path: str, *, params: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
+    """Perform an authenticated GET request against the Discogs API."""
+    token = get_token()
+    query = f"?{urlencode(params)}" if params else ""
+    url = f"{DISCOGS_API_BASE}{path}{query}"
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Discogs token={token}",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+        method="GET",
     )
 
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+            return json.loads(payload)
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise DiscogsApiError(f"Discogs API returned HTTP {exc.code}: {details}") from exc
+    except URLError as exc:
+        raise DiscogsApiError(f"Discogs API request failed: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise DiscogsApiError("Discogs API returned invalid JSON") from exc
 
-def test_auth() -> dict:
-    """Test authentication and return user info."""
-    client = get_client()
-    me = client.identity()
+
+def test_auth() -> dict[str, Any]:
+    """Authenticate and return non-secret Discogs identity metadata."""
+    identity = discogs_get("/oauth/identity")
     return {
-        "username": me.username,
-        "id": me.id,
-        "num_collection": me.num_collection,
+        "username": identity.get("username"),
+        "id": identity.get("id"),
+        "resource_url": identity.get("resource_url"),
+        "consumer_name": identity.get("consumer_name"),
     }
 
 
-def fetch_collection() -> list[dict]:
-    """
-    Fetch the full collection from Discogs.
+def fetch_collection(username: str | None = None, *, per_page: int = 50, sleep_seconds: float = 1.1) -> dict[str, Any]:
+    """Fetch all collection releases for a Discogs user with explicit pagination."""
+    if username is None:
+        identity = test_auth()
+        username = identity["username"]
+    if not username:
+        raise DiscogsConfigError("Could not determine Discogs username from identity or DISCOGS_USERNAME.")
 
-    Returns a list of dicts, one per collection item, with release details.
-    The library handles pagination automatically.
-    """
-    client = get_client()
-    me = client.identity()
+    releases: list[dict[str, Any]] = []
+    page = 1
+    total_pages = 1
+    total_items = None
 
-    print(f"Fetching collection for {me.username}...")
-    print(f"Expected items: {me.num_collection}")
+    while page <= total_pages:
+        payload = discogs_get(
+            f"/users/{username}/collection/folders/0/releases",
+            params={"page": page, "per_page": per_page, "sort": "added", "sort_order": "desc"},
+        )
+        pagination = payload.get("pagination", {})
+        total_pages = int(pagination.get("pages") or 1)
+        total_items = pagination.get("items", total_items)
+        page_releases = payload.get("releases", [])
+        releases.extend(page_releases)
+        print(f"Fetched page {page}/{total_pages}: {len(page_releases)} releases")
+        page += 1
+        if page <= total_pages:
+            time.sleep(sleep_seconds)
 
-    collection = []
-    folder = me.collection_folders[0]  # Folder 0 = all items
-
-    for i, item in enumerate(folder.releases, 1):
-        release = item.release
-
-        record = {
-            "instance_id": item.id,
-            "date_added": str(item.date_added),
-            "rating": item.rating,
-            "folder_id": item.folder_id,
-            "release": {
-                "id": release.id,
-                "title": release.title,
-                "year": release.year,
-                "artists": [
-                    {"name": a.name, "id": a.id} for a in release.artists
-                ],
-                "genres": release.genres,
-                "styles": getattr(release, "styles", []),
-                "formats": release.formats,
-                "labels": [
-                    {"name": l.name, "catno": l.data.get("catno", "")}
-                    for l in release.labels
-                ],
-                "country": getattr(release, "country", ""),
-                "tracklist": [
-                    {"position": t.position, "title": t.title}
-                    for t in release.tracklist
-                ],
-            },
-        }
-
-        collection.append(record)
-
-        if i % 25 == 0:
-            print(f"  Fetched {i} items...")
-
-    print(f"Done! Fetched {len(collection)} items total.")
-    return collection
+    return {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "username": username,
+        "source": "discogs_collection_folder_0",
+        "expected_count": total_items,
+        "record_count": len(releases),
+        "releases": releases,
+    }
 
 
-def save_raw(data: list[dict], filename: str | None = None) -> Path:
-    """Save raw collection data to a JSON file in data/raw/."""
+def save_raw_collection(data: dict[str, Any], filename: str | None = None) -> Path:
+    """Save raw collection data to data/raw/collection_YYYY-MM-DD.json."""
     if filename is None:
-        today = datetime.now().strftime("%Y-%m-%d")
-        filename = f"collection_{today}.json"
+        filename = f"collection_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.json"
 
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = RAW_DATA_DIR / filename
-
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2, default=str)
-
-    print(f"Saved to {filepath} ({len(data)} items)")
-    return filepath
+    path = RAW_DATA_DIR / filename
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    print(f"Saved {data.get('record_count', 0)} collection records to {path}")
+    return path
 
 
-# ---- Main entry point ----
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Discogs ingestion utility for Vinyl Vault")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--test-auth", action="store_true", help="Verify Discogs token and print user metadata")
+    action.add_argument("--fetch-collection", action="store_true", help="Fetch full collection and save raw JSON")
+    parser.add_argument("--username", help="Discogs username; defaults to API identity or DISCOGS_USERNAME")
+    parser.add_argument("--output", help="Optional output filename under data/raw/")
+    parser.add_argument("--per-page", type=int, default=50, choices=range(1, 101), metavar="1-100")
+    parser.add_argument("--sleep-seconds", type=float, default=1.1, help="Delay between paginated requests")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.fetch_collection:
+            username = args.username or get_configured_username()
+            data = fetch_collection(username=username, per_page=args.per_page, sleep_seconds=args.sleep_seconds)
+            save_raw_collection(data, args.output)
+            return 0
+
+        # Safe default: auth-only smoke test.
+        user_info = test_auth()
+        print(f"Authenticated as: {user_info.get('username')}")
+        print(f"Discogs user id: {user_info.get('id')}")
+        print(f"Consumer app: {user_info.get('consumer_name')}")
+        return 0
+    except (DiscogsConfigError, DiscogsApiError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    # Step 1: Test authentication
-    print("Testing Discogs authentication...")
-    try:
-        user_info = test_auth()
-        print(f"✓ Authenticated as: {user_info['username']}")
-        print(f"  Collection size: {user_info['num_collection']} items")
-    except Exception as e:
-        print(f"✗ Authentication failed: {e}")
-        print("  Make sure your .env file has a valid DISCOGS_USER_TOKEN")
-        exit(1)
-
-    print()
-
-    # Step 2: Fetch collection
-    collection = fetch_collection()
-
-    # Step 3: Save raw data
-    filepath = save_raw(collection)
-
-    print()
-    print(f"Next step: explore the data in {filepath}")
-    print("Try: python -c \"import json; data = json.load(open('{}')); print(len(data))\"".format(filepath))
+    raise SystemExit(main())
